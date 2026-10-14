@@ -1,0 +1,232 @@
+name: SimulationCraft download
+
+# Builds SimulationCraft's newest source and publishes it on the rolling
+# "simc-latest" release, with a manifest (simc-latest.json). Its "builds" list
+# every platform's zip, SHA-256 and the build it holds (version, game build,
+# commit and its date); the top level and "assets" are the newest build and
+# the zips that hold it, for app versions before v0.22.1. The app reads that
+# manifest to tell you when a newer SimulationCraft is out, and its Update
+# button downloads the zip for your computer (src/sim/simc-update.js).
+# Runs every week for Windows and Linux, or from the Actions tab, where Mac
+# (arm64 and x64) can be ticked too: on a private repository a Mac build minute
+# costs ten Linux minutes. On a public repository (Actions minutes are free)
+# the weekly run builds Mac too. A platform not built keeps its last build. It
+# skips a platform whose build already has SimulationCraft's newest commit.
+on:
+  schedule:
+    - cron: '17 9 * * 3'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Build even if SimulationCraft has not changed'
+        type: boolean
+        default: false
+      windows:
+        description: 'Windows'
+        type: boolean
+        default: true
+      linux:
+        description: 'Linux'
+        type: boolean
+        default: true
+      mac:
+        description: 'Mac (arm64 and x64; Mac build minutes cost 10x on a private repository)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: simc-latest
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.head.outputs.commit }}
+      build: ${{ steps.head.outputs.build }}
+      windows: ${{ steps.head.outputs.windows }}
+      linux: ${{ steps.head.outputs.linux }}
+      mac: ${{ steps.head.outputs.mac }}
+    steps:
+      - id: head
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          FORCE: ${{ inputs.force }}
+          # The weekly run builds the default platforms.
+          WINDOWS: ${{ github.event_name != 'workflow_dispatch' || inputs.windows }}
+          LINUX: ${{ github.event_name != 'workflow_dispatch' || inputs.linux }}
+          MAC: ${{ github.event_name == 'workflow_dispatch' && inputs.mac }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = schedule ] && [ "$(gh api "repos/$REPO" --jq .private 2>/dev/null || true)" = false ]; then
+            echo "Public repository: Actions minutes are free, so the weekly run builds Mac too."
+            MAC=true
+          fi
+          commit=$(git ls-remote https://github.com/simulationcraft/simc.git HEAD | cut -f1)
+          if [ -z "$commit" ]; then echo "::error::Could not read SimulationCraft's newest commit"; exit 1; fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "SimulationCraft HEAD: $commit"
+          # The published manifest. Only "no release / no manifest yet" counts as
+          # empty: any other error stops here rather than rebuild everything.
+          if manifest=$(gh release download simc-latest --repo "$REPO" --pattern simc-latest.json --output - 2>"$RUNNER_TEMP/gh.err"); then
+            jq -e 'type == "object"' <<< "$manifest" > /dev/null
+          elif grep -qiE 'release not found|no assets' "$RUNNER_TEMP/gh.err"; then
+            manifest='{}'
+          else
+            cat "$RUNNER_TEMP/gh.err" >&2
+            echo "::error::Could not read the published simc-latest.json"
+            exit 1
+          fi
+          # The commit a platform's published build has (manifests before
+          # v0.22.1 have no "builds" and give it once, at the top).
+          published() { jq -r --arg p "$1" '(.builds // .assets // {})[$p] as $a | if $a then ($a.commit // .commit // "") else "" end' <<< "$manifest"; }
+          build=false
+          for p in windows linux mac; do
+            want=false
+            case $p in windows) want=$WINDOWS ;; linux) want=$LINUX ;; mac) want=$MAC ;; esac
+            todo=false
+            if [ "$want" = true ]; then
+              keys=$p
+              if [ "$p" = mac ]; then keys="mac-arm64 mac-x64"; fi
+              for k in $keys; do
+                have=$(published "$k")
+                echo "$k: published ${have:-none}"
+                if [ "$FORCE" = true ] || [ "$have" != "$commit" ]; then todo=true; fi
+              done
+            fi
+            echo "$p=$todo" >> "$GITHUB_OUTPUT"
+            if [ "$todo" = true ]; then build=true; fi
+          done
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          if [ "$build" != true ]; then echo "Nothing to build: the asked-for platforms already have SimulationCraft's newest commit."; fi
+
+  simc:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    uses: ./.github/workflows/simc-build.yml
+    with:
+      ref: ${{ needs.check.outputs.commit }}
+      windows: ${{ needs.check.outputs.windows == 'true' }}
+      linux: ${{ needs.check.outputs.linux == 'true' }}
+      mac: ${{ needs.check.outputs.mac == 'true' }}
+      # A failed platform (say Mac) doesn't hold back the others: they're
+      # published, and the run still shows as failed.
+      fail_fast: false
+
+  publish:
+    needs: [check, simc]
+    if: ${{ !cancelled() && needs.check.outputs.build == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      COMMIT: ${{ needs.check.outputs.commit }}
+      WINDOWS: ${{ needs.check.outputs.windows }}
+      LINUX: ${{ needs.check.outputs.linux }}
+      MAC: ${{ needs.check.outputs.mac }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: simc
+      - name: Zip each platform and write the manifest
+        run: |
+          # The published manifest; any error but "not there yet" stops here,
+          # before anything is uploaded or deleted.
+          if old=$(gh release download simc-latest --repo "$REPO" --pattern simc-latest.json --output - 2>"$RUNNER_TEMP/gh.err"); then
+            jq -e 'type == "object"' <<< "$old" > /dev/null
+          elif grep -qiE 'release not found|no assets' "$RUNNER_TEMP/gh.err"; then
+            old='{}'
+          else
+            cat "$RUNNER_TEMP/gh.err" >&2
+            echo "::error::Could not read the published simc-latest.json"
+            exit 1
+          fi
+          # Only what this run was asked to build (a re-run can also download
+          # artifacts from earlier attempts), and never an older build than the
+          # one published.
+          shopt -s nullglob
+          dirs=()
+          for dir in simc/simc-*/; do
+            p=$(basename "$dir")
+            p=${p#simc-}
+            case $p in windows) want=$WINDOWS ;; linux) want=$LINUX ;; mac-*) want=$MAC ;; *) want=false ;; esac
+            have=$(tr -d '[:space:]' < "${dir}SIMC-COMMIT.txt")
+            made=$(tr -d '[:space:]' < "${dir}SIMC-DATE.txt")
+            published=$(jq -r --arg p "$p" '(.builds // .assets // {})[$p] as $a | if $a then ($a.commitTime // .commitTime // 0) else 0 end' <<< "$old")
+            if [ "$want" != true ] || [ "$have" != "$COMMIT" ]; then echo "Skipping $p: not built in this run."; continue; fi
+            if [ "$made" -lt "$published" ]; then echo "Skipping $p: the published build is newer."; continue; fi
+            dirs+=("$dir")
+          done
+          if [ "${#dirs[@]}" -eq 0 ]; then echo "::error::Nothing new to publish"; exit 1; fi
+          # Each build job ran its own simc to read the version; any one of them will do.
+          banner=$(for dir in "${dirs[@]}"; do cat "${dir}SIMC-BANNER.txt"; done | tr -d '\r' | grep -m1 'SimulationCraft [0-9]' || true)
+          echo "$banner"
+          version=$(echo "$banner" | grep -oE 'SimulationCraft [0-9]+-[0-9]+' | head -1 | cut -d' ' -f2)
+          game=$(echo "$banner" | grep -oE 'World of Warcraft [0-9.]+' | head -1 | cut -d' ' -f4)
+          if [ -z "$version" ] || [ -z "$game" ]; then echo "::error::Could not read the SimulationCraft version"; exit 1; fi
+          commit_time=$(tr -d '[:space:]' < "${dirs[0]}SIMC-DATE.txt")
+          built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          mkdir -p out
+          built='{}'
+          for dir in "${dirs[@]}"; do
+            p=$(basename "$dir")
+            p=${p#simc-}
+            rm -f "${dir}SIMC-BANNER.txt"
+            if [ "$p" != windows ]; then chmod +x "${dir}simc"; fi
+            # Run id and attempt: a rebuild or re-run of the same commit never replaces a zip a client may be downloading.
+            name="simc-$p-${COMMIT:0:7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.zip"
+            (cd "$dir" && zip -X -q "../../out/$name" ./*)
+            sha=$(sha256sum "out/$name" | cut -d' ' -f1)
+            size=$(stat -c%s "out/$name")
+            built=$(jq -c --arg p "$p" --arg n "$name" --arg s "$sha" --argjson z "$size" \
+              --arg v "$version" --arg g "$game" --arg c "$COMMIT" --argjson t "$commit_time" --arg b "$built_at" \
+              '.[$p] = {name: $n, sha256: $s, size: $z, version: $v, game: $g, commit: $c, commitTime: $t, builtAt: $b}' <<< "$built")
+          done
+          # Platforms not built this time keep their last build. "builds" has
+          # every platform. The top level is the newest build, and "assets" only
+          # the zips holding it, so app versions that only read those never get
+          # an older zip than it says (they see no build for a platform that's behind).
+          jq -n --argjson old "$old" --argjson built "$built" '
+            (($old.builds // $old.assets // {}) | with_entries(.value = ({version: $old.version, game: $old.game, commit: $old.commit, commitTime: $old.commitTime, builtAt: $old.builtAt} + .value))) as $kept
+            | ($kept + $built) as $all
+            | ([$all[]] | max_by(.commitTime // 0)) as $top
+            | {version: $top.version, game: $top.game, commit: $top.commit, commitTime: $top.commitTime, builtAt: $top.builtAt,
+               builds: $all, assets: ($all | with_entries(select(.value.commit == $top.commit)))}' > out/simc-latest.json
+          cat out/simc-latest.json
+          {
+            echo "VERSION=$version"
+            echo "GAME=$game"
+            echo "BUILT=$(jq -r 'keys | join(" ")' <<< "$built")"
+          } >> "$GITHUB_ENV"
+      - name: Publish on the simc-latest release
+        run: |
+          notes="SimulationCraft ${VERSION} for World of Warcraft ${GAME}, built from [simulationcraft/simc@${COMMIT:0:10}](https://github.com/simulationcraft/simc/tree/${COMMIT}) for ${BUILT// /, } (command-line program, GPL-3.0; licence in SIMC-LICENSE.txt). Other platforms keep their last build; simc-latest.json says which build each zip holds. WoW Upgrade Advisor downloads these from its SimulationCraft panel; you don't need to download them yourself."
+          if ! gh release view simc-latest --repo "$REPO" >/dev/null 2>&1; then
+            gh release create simc-latest --repo "$REPO" --target "${{ github.sha }}" --prerelease --latest=false \
+              --title "SimulationCraft (latest build)" --notes "$notes"
+          fi
+          old=$(gh release view simc-latest --repo "$REPO" --json assets -q '.assets[].name')
+          keep=$(jq -r '.builds[].name' out/simc-latest.json)
+          # Zips first, then the manifest that points at them, then the replaced
+          # zips of the platforms built in this run (never another platform's).
+          gh release upload simc-latest --repo "$REPO" --clobber out/*.zip
+          gh release upload simc-latest --repo "$REPO" --clobber out/simc-latest.json
+          for name in $old; do
+            if [ "$name" = simc-latest.json ] || grep -qxF "$name" <<< "$keep"; then continue; fi
+            for p in $BUILT; do
+              case $name in "simc-$p-"*) gh release delete-asset simc-latest "$name" --repo "$REPO" -y; break ;; esac
+            done
+          done
+          gh release edit simc-latest --repo "$REPO" --notes "$notes"
+      - name: Report platforms that didn't build
+        if: needs.simc.result == 'failure'
+        run: |
+          echo "::error::Some platforms failed to build; the others were published."
+          exit 1

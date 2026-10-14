@@ -1,0 +1,94 @@
+name: Build SimulationCraft
+
+# Builds SimulationCraft's command-line program for the platforms asked for.
+# Used by the release (simc next to the app in each zip) and by the weekly
+# SimulationCraft download (simc.yml). Each platform is a job of its own, and
+# Mac is off unless asked for: on a private repository a Mac build minute
+# costs ten Linux minutes. Each platform's simc, licence, source commit (and
+# its date) and version banner end up in an artifact named simc-<platform>.
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'simulationcraft/simc commit or branch to build (default branch if empty)'
+        type: string
+        default: ''
+      windows:
+        type: boolean
+        default: true
+      linux:
+        type: boolean
+        default: true
+      mac:
+        description: 'Mac arm64 and x64'
+        type: boolean
+        default: false
+      fail_fast:
+        description: 'Stop the other platforms when one fails'
+        type: boolean
+        default: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.platforms.outputs.include }}
+    steps:
+      - id: platforms
+        run: |
+          include=$(jq -cn --argjson windows '${{ inputs.windows }}' --argjson linux '${{ inputs.linux }}' --argjson mac '${{ inputs.mac }}' '[
+            (if $windows then {name: "windows", os: "windows-latest", cmake_extra: "-GNinja"} else empty end),
+            (if $mac then {name: "mac-arm64", os: "macos-latest", cmake_extra: "-DCMAKE_OSX_ARCHITECTURES=arm64"} else empty end),
+            (if $mac then {name: "mac-x64", os: "macos-latest", cmake_extra: "-DCMAKE_OSX_ARCHITECTURES=x86_64"} else empty end),
+            (if $linux then {name: "linux", os: "ubuntu-latest", cmake_extra: ""} else empty end)
+          ]')
+          echo "Building: $(jq -r 'map(.name) | join(", ")' <<< "$include")"
+          echo "include=$include" >> "$GITHUB_OUTPUT"
+
+  simc:
+    name: SimulationCraft (${{ matrix.name }})
+    needs: plan
+    if: needs.plan.outputs.include != '[]'
+    strategy:
+      fail-fast: ${{ inputs.fail_fast }}
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.include) }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: simulationcraft/simc
+          ref: ${{ inputs.ref }}
+          path: simc-src
+          fetch-depth: 1
+      # Same setup SimulationCraft's own CI uses on Windows: MSVC + Ninja.
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: matrix.name == 'windows'
+      - name: Build simc (command line only)
+        working-directory: simc-src
+        run: |
+          cmake -S . -B build -DBUILD_GUI=OFF -DSC_NO_NETWORKING=ON -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_extra }}
+          cmake --build build --target simc --config Release --parallel 4
+      - name: Collect binary and licence
+        run: |
+          mkdir -p out
+          bin=$(find simc-src/build -type f \( -name simc.exe -o -name simc \) | head -1)
+          echo "Found $bin"
+          cp "$bin" out/
+          if [ "${{ matrix.name }}" != windows ]; then strip out/simc || true; fi
+          cp simc-src/COPYING out/SIMC-LICENSE.txt
+          echo "$(git -C simc-src rev-parse HEAD)" > out/SIMC-COMMIT.txt
+          # When that commit was made (Unix time): the app compares it with the newest download.
+          git -C simc-src log -1 --format=%ct > out/SIMC-DATE.txt
+          # Its version and game build, for the download manifest (read here, where
+          # it can run; a Mac x64 build may not run on the arm64 runner, so it may be empty).
+          ("./out/$(basename "$bin")" 2>&1 || true) | head -5 > out/SIMC-BANNER.txt
+          head -1 out/SIMC-BANNER.txt
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: simc-${{ matrix.name }}
+          path: out/
