@@ -7,11 +7,12 @@ name: SimulationCraft download
 # the zips that hold it, for app versions before v0.22.1. The app reads that
 # manifest to tell you when a newer SimulationCraft is out, and its Update
 # button downloads the zip for your computer (src/sim/simc-update.js).
-# Runs every week for Windows and Linux, or from the Actions tab, where Mac
-# (arm64 and x64) can be ticked too: on a private repository a Mac build minute
-# costs ten Linux minutes. On a public repository (Actions minutes are free)
-# the weekly run builds Mac too. A platform not built keeps its last build. It
-# skips a platform whose build already has SimulationCraft's newest commit.
+# Runs every week on a public repository (Actions minutes are free there) for
+# Windows, Mac (arm64 and x64) and Linux. On a private repository the weekly
+# run builds nothing, since the app can't download from it; run it from the
+# Actions tab there (Windows and Linux ticked by default, Mac when ticked: a Mac
+# build minute costs ten Linux minutes). A platform not built keeps its last
+# build. It skips a platform whose build already has SimulationCraft's newest commit.
 on:
   schedule:
     - cron: '17 9 * * 3'
@@ -57,14 +58,28 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           FORCE: ${{ inputs.force }}
-          # The weekly run builds the default platforms.
+          # The weekly run builds the default platforms (and Mac on a public repository).
           WINDOWS: ${{ github.event_name != 'workflow_dispatch' || inputs.windows }}
           LINUX: ${{ github.event_name != 'workflow_dispatch' || inputs.linux }}
           MAC: ${{ github.event_name == 'workflow_dispatch' && inputs.mac }}
         run: |
-          if [ "$GITHUB_EVENT_NAME" = schedule ] && [ "$(gh api "repos/$REPO" --jq .private 2>/dev/null || true)" = false ]; then
-            echo "Public repository: Actions minutes are free, so the weekly run builds Mac too."
-            MAC=true
+          if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            private=unknown
+            for try in 1 2 3; do
+              if private=$(gh api "repos/$REPO" --jq .private 2>/dev/null); then break; fi
+              private=unknown
+              sleep 5
+            done
+            if [ "$private" = false ]; then
+              echo "Public repository: Actions minutes are free, so the weekly run builds Mac too."
+              MAC=true
+            else
+              # The app downloads without a GitHub login, so nobody can download
+              # from a private repository: the weekly run would only use up minutes.
+              echo "Private repository (or its visibility couldn't be read): the weekly run builds nothing. Run it from the Actions tab if you want a build here."
+              { echo "build=false"; echo "windows=false"; echo "linux=false"; echo "mac=false"; } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
           commit=$(git ls-remote https://github.com/simulationcraft/simc.git HEAD | cut -f1)
           if [ -z "$commit" ]; then echo "::error::Could not read SimulationCraft's newest commit"; exit 1; fi
