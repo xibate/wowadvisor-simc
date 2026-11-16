@@ -64,6 +64,8 @@ jobs:
           ref: ${{ inputs.ref }}
           path: simc-src
           fetch-depth: 1
+          # Its build runs SimulationCraft's own scripts: no token left in its .git/config.
+          persist-credentials: false
       # Same setup SimulationCraft's own CI uses on Windows: MSVC + Ninja.
       - uses: ilammy/msvc-dev-cmd@v1
         if: matrix.name == 'windows'
